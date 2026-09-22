@@ -5,10 +5,21 @@
 
   python3 mkreport.py slots.json [outdir]
 
+종료 코드
+  0 = GATE PASS      (초안을 만들어도 된다)
+  3 = GATE HOLD      (본문에 사실관계 위반이 있다. 고쳐서 다시 렌더할 것)
+  2 = 사용법 오류
+
 설계 원칙
   - LLM은 값만 만든다. 색·막대폭·[미확보]·부호 표기·게이트는 전부 여기서 결정한다.
   - null = 미확보. 절대 근사치로 대체하지 않는다.
   - 표준 라이브러리만 사용(클라우드 런타임에 numpy/pandas 없음).
+
+메일 HTML 제약(2026-09-22 실측, Gmail 초안 저장 시점에 적용됨)
+  - CSS `background` 단축 속성은 통째로 삭제된다. `background-color`와 bgcolor 속성은 남는다.
+  - <!doctype>/<html>/<head>/<body>/role 속성은 삭제된다. 페이지 배경을 body에 걸면 사라진다.
+  - 웹폰트는 로드되지 않는다. monospace 지정은 타자기체 폴백으로 보인다.
+  => 배경이 필요한 곳은 전부 bgcolor 속성 + background-color 두 벌로 선언한다.
 """
 
 import sys, os, json, re, html
@@ -32,10 +43,50 @@ MISSING = "[미확보]"
 HEDGE_WORDS = ["약 ", "추정", "근사", "가량", "안팎", "내외"]
 WEEKDAY_KO = "월화수목금토일"
 
+# ── B-1: 미확보 슬롯의 대상은 본문 판단 문장에 쓸 수 없다 ────────────────
+#   (슬롯 라벨에 들어 있는 말, 본문에서 금지되는 말)
+NULL_TOPIC_WORDS = [
+    (("WTI", "유가", "원유"),        ("유가", "원유", "WTI", "브렌트", "oil", "Oil", "OIL")),
+    (("DXY", "달러지수", "달러 인덱스"), ("DXY", "달러지수", "달러 인덱스", "달러인덱스")),
+    (("GLD",),                      ("GLD", "금값", "금 가격", "귀금속")),
+    (("TLT",),                      ("TLT", "장기국채")),
+    (("VIX",),                      ("VIX", "변동성지수")),
+    (("공포탐욕", "F&G", "FEAR"),    ("공포탐욕", "공포·탐욕", "공포 탐욕", "탐욕지수")),
+    (("10년물",),                   ("10년물", "장기금리")),
+    (("2년물",),                    ("2년물", "단기금리")),
+    (("2s10s", "2S10S"),            ("2s10s", "장단기 스프레드", "스프레드")),
+    (("원/달러", "USDKRW"),          ("원/달러", "환율")),
+    (("러셀",),                     ("러셀",)),
+    (("SOX", "필라델피아 반도체"),    ("SOX", "필라델피아 반도체")),
+    (("SMH",),                      ("SMH",)),
+    (("EWY",),                      ("EWY",)),
+    (("TSM", "TSMC"),               ("TSMC",)),
+    (("쿠팡", "CPNG"),               ("쿠팡",)),
+]
+
+# ── B-3: 내부 사정 문자열 (푸터 한 줄과 제목 꼬리표 외에는 금지) ─────────
+INTERNAL_WORDS = ["시트A", "시트B", "시트C", "시트 A", "시트 B", "시트 C",
+                  "노션", "프록시", "stale", "Stale", "STALE", "백필",
+                  "EDGAR", "slots.json", "게이트", "롤링 OLS", "미산출"]
+
+# ── B-2: 발표 요일이 고정된 지표 (요일이 어긋나면 그 행은 틀린 것) ───────
+FIXED_WEEKDAY = [
+    (("신규 실업수당", "실업수당 청구", "실업보험 청구"), "목"),
+    (("원유재고", "원유 재고", "EIA"),                    "수"),
+    (("천연가스 재고", "천연가스재고"),                     "목"),
+]
+
+# ── B-4: 최상급·기록 표현 ────────────────────────────────────────────────
+SUPERLATIVE_PATS = ["사상 첫", "사상 최고", "사상 최저", "역대", "최대 상승", "최대 하락",
+                    "최고치", "최저치", "신기록", "최강", "처음으로", "최초", "돌파",
+                    "번째 기업", "번째로", r"\d+년 만"]
+# 근거가 이 말들로만 되어 있으면 '확인'이 아니다 (기사 제목·전망은 근거가 아니다)
+WEAK_BASIS_RE = re.compile(r"기사|헤드라인|제목|보도|전망|임박|관측|예상|set to|expected|likely")
+
 
 # ── 작은 템플릿 엔진 ──────────────────────────────────────────────────────
 # {{#NAME}}…{{/NAME}}  : NAME이 리스트면 반복, 불리언이면 조건
-# {{KEY}}              : 치환 (HTML 이스케이프, __RAW_ 접두는 원문 유지)
+# {{KEY}}              : 치환 (HTML 이스케이프, RAW_ 접두는 원문 유지)
 SECTION_RE = re.compile(r"\{\{#([A-Z0-9_]+)\}\}(.*?)\{\{/\1\}\}", re.S)
 VAR_RE = re.compile(r"\{\{([A-Z0-9_]+)\}\}")
 
@@ -72,7 +123,7 @@ def color_of(chg):
 
 
 def fmt_chg(chg, unit="%", digits=2):
-    """등락 표기. bp는 부호 붙인 정수형, %는 소수 2자리."""
+    """등락 표기. bp는 부호 붙인 소수 1자리, %는 소수 2자리."""
     if chg is None:
         return MISSING
     if unit == "bp":
@@ -81,12 +132,15 @@ def fmt_chg(chg, unit="%", digits=2):
 
 
 def cell(value, chg=None, unit="%"):
-    """타일 한 칸: VALUE / VALUE_COLOR / CHG / COLOR 를 만든다."""
+    """타일 한 칸: VALUE / VALUE_COLOR / CHG / COLOR 를 만든다.
+
+    값이 없으면 등락 칸은 빈 문자열이다 — [미확보]를 한 칸에 두 번 찍지 않는다(A-3).
+    """
     missing = value is None
     return {
         "VALUE": MISSING if missing else str(value),
         "VALUE_COLOR": NA if missing else INK,
-        "CHG": fmt_chg(chg, unit),
+        "CHG": "" if missing else fmt_chg(chg, unit),
         "COLOR": color_of(chg),
     }
 
@@ -99,19 +153,30 @@ def tile(t):
     return d
 
 
+def tiles_of(items, per_row=None):
+    """타일 목록 -> 컨텍스트. 칸 폭 W를 개수에 맞춰 나눈다."""
+    out = [tile(t) for t in (items or [])]
+    n = per_row or len(out) or 1
+    for d in out:
+        d["W"] = int(100 // n)
+    return out
+
+
 def bars(items):
-    """섹터 중앙축 막대. 폭 = |chg| / max|chg| * 118px."""
+    """섹터 중앙축 막대. 폭 = max(1, |chg| / max|chg| * 118)px."""
     vals = [abs(s["chg"]) for s in items if s.get("chg") is not None]
     top = max(vals) if vals else 0.0
     out = []
     for s in items:
         chg = s.get("chg")
-        px = 0 if (chg is None or top == 0) else int(round(abs(chg) / top * BAR_MAX_PX))
+        px = 0 if (chg is None or top == 0) else max(1, int(round(abs(chg) / top * BAR_MAX_PX)))
         out.append({
             "NAME": s.get("name", ""),
             "CHG": fmt_chg(chg),
             "COLOR": color_of(chg),
             "BAR_PX": px,
+            "PAD_PX": max(0, BAR_MAX_PX - px),
+            "IF_PAD": bool(BAR_MAX_PX - px > 0),
             "IF_POS": bool(chg is not None and chg > FLAT_EPS),
             "IF_NEG": bool(chg is not None and chg < -FLAT_EPS),
         })
@@ -145,73 +210,181 @@ def table(spec):
     return head, rows
 
 
+# ── 슬롯 정합 (A-3) ───────────────────────────────────────────────────────
+def _find(items, *needles):
+    for it in items or []:
+        lab = str(it.get("label", ""))
+        if any(n in lab for n in needles):
+            return it
+    return None
+
+
+def sync_us10y(s):
+    """미국 10년물은 슬롯 하나다. 상단 타일과 섹션 3 금리 타일이 달라질 수 없다(A-3).
+
+    정본은 상단 타일(시트A). 상단이 비어 있고 금리 타일에만 값이 있으면 반대로 채운다.
+    """
+    a = _find(s.get("tiles"), "10년물")
+    b = _find(s.get("rate_tiles"), "10년물")
+    if not a or not b:
+        return None
+    src, dst = (a, b) if a.get("value") is not None else (b, a)
+    note = None
+    if (dst.get("value"), dst.get("chg")) != (src.get("value"), src.get("chg")):
+        note = "10년물 슬롯 정합: {} {} -> {} {} (정본 {})".format(
+            dst.get("value"), dst.get("chg"), src.get("value"), src.get("chg"),
+            "상단 타일" if src is a else "금리 타일")
+    dst["value"], dst["chg"] = src.get("value"), src.get("chg")
+    dst["unit"] = src.get("unit", dst.get("unit", "bp"))
+    return note
+
+
+def drop_upside_less_rows(s):
+    """현재가가 없으면 Upside를 못 낸다. 그 컨센서스 행은 싣지 않는다(C-1)."""
+    spec = s.get("consensus") or {}
+    head = spec.get("head") or []
+    idx = next((i for i, h in enumerate(head) if "현재가" in str(h[0])), None)
+    if idx is None:
+        return []
+    kept, dropped = [], []
+    for r in spec.get("rows") or []:
+        c = r[idx] if idx < len(r) else None
+        val = c.get("t") if isinstance(c, dict) else c
+        if val is None or str(val).strip() in ("", MISSING):
+            dropped.append(str(r[0].get("t") if isinstance(r[0], dict) else r[0]) if r else "?")
+        else:
+            kept.append(r)
+    spec["rows"] = kept
+    return dropped
+
+
+# ── 본문 텍스트 수집 ──────────────────────────────────────────────────────
+def judgement_text(s):
+    """LLM이 '판단'을 쓴 자리만 모은다. 뉴스 제목·캘린더 원문은 제외한다."""
+    parts = [s.get("headline", ""), s.get("subtitle", ""),
+             " ".join(s.get("key_points") or []),
+             s.get("summary_prose", ""), s.get("sector_note", ""),
+             s.get("sector_note_top", ""), s.get("sector_footnote", ""),
+             s.get("cons_note", ""), s.get("cons_footnote", ""),
+             s.get("s4_footnote", ""), s.get("flow_footnote", ""), s.get("s5_footnote", ""),
+             s.get("source_note_1", "")]
+    for r in s.get("macro_rows") or []:
+        parts += [r.get("k", ""), r.get("v", "")]
+    for r in s.get("map_rows") or []:
+        parts += [r.get("a", ""), r.get("b", "")]
+    dd = s.get("deep_dive") or {}
+    parts += [dd.get("title", ""), dd.get("prose", "")]
+    for r in dd.get("rows") or []:
+        parts += [r.get("k", ""), r.get("v", "")]
+    return " ".join(x for x in parts if x)
+
+
+def all_slot_items(s):
+    for key in ("tiles", "aux", "rate_tiles", "s4_tiles"):
+        for it in s.get(key) or []:
+            yield it
+
+
 # ── 게이트 (지시서 §4-E) ──────────────────────────────────────────────────
 def count_missing(s):
     """미확보 '항목' 수. 한 항목에 값·등락이 둘 다 비어도 1건으로 센다."""
     n = 0
-    for key in ("tiles", "aux", "rate_tiles", "s4_tiles"):
-        for it in s.get(key) or []:
-            if it.get("value") is None or it.get("chg") is None:
-                n += 1
+    for it in all_slot_items(s):
+        if it.get("value") is None or it.get("chg") is None:
+            n += 1
     for it in s.get("sectors") or []:        # 섹터는 등락률만 쓰는 항목
         if it.get("chg") is None:
             n += 1
     return n
 
 
-def superlatives(s):
-    """최상급·기록 표현을 뽑아 [종료] 로그에 올린다(지시서 §4-E-6).
+def null_topic_leak(s):
+    """B-1. 값이 [미확보]인 대상을 본문 판단 문장에서 언급하면 막는다."""
+    text = judgement_text(s)
+    out = []
+    for it in all_slot_items(s):
+        if it.get("value") is not None:
+            continue
+        label = str(it.get("label", ""))
+        for label_keys, body_words in NULL_TOPIC_WORDS:
+            if not any(k in label for k in label_keys):
+                continue
+            hits = sorted({w for w in body_words if w in text})
+            if hits:
+                out.append("미확보 슬롯 '{}'를 본문이 언급: {}".format(label, ", ".join(hits)))
+    return sorted(set(out))
 
-    기계가 근거까지 확인할 수는 없으므로 HOLD로 막지 않고 '확인 대상'으로만 내민다.
-    """
-    text = " ".join(filter(None, [
-        s.get("headline", ""), s.get("subtitle", ""),
-        " ".join(s.get("key_points") or []),
-        s.get("summary_prose", ""), s.get("sector_note", ""), s.get("cons_note", ""),
-        (s.get("deep_dive") or {}).get("prose", ""),
-    ]))
-    pats = ["사상 첫", "사상 최고", "사상 최저", "역대", "최대 상승", "최대 하락",
-            "최고치", "최저치", "신기록", "최강", "처음으로", r"\d+년 만"]
+
+def internal_leak(s):
+    """B-3. 내부 사정 문자열은 본문에 못 쓴다(푸터·제목 꼬리표만 예외)."""
+    text = judgement_text(s)
+    hits = sorted({w for w in INTERNAL_WORDS if w in text})
+    return ["내부 사정 노출: {}".format(", ".join(hits))] if hits else []
+
+
+def superlative_blocks(s):
+    """B-4. 최상급 표현마다 근거가 기록돼 있어야 한다. 없으면 표현을 지운다."""
+    checks = s.get("superlative_checks") or []
+    out = []
+    for snip in superlatives(s):
+        ok = False
+        for c in checks:
+            expr = str(c.get("expr", "")).strip()
+            basis = str(c.get("basis", "")).strip()
+            if expr and expr in snip and len(basis) >= 10 and not WEAK_BASIS_RE.search(basis):
+                ok = True
+                break
+        if not ok:
+            out.append("최상급 근거 미기재(삭제하거나 superlative_checks에 근거를 적을 것): …{}…".format(snip))
+    return out
+
+
+def superlatives(s):
+    """최상급·기록 표현을 뽑는다(지시서 §4-E-6)."""
+    text = judgement_text(s)
     found = []
-    for p in pats:
+    for p in SUPERLATIVE_PATS:
         for m in re.finditer(p, text):
-            found.append(text[max(0, m.start() - 12): m.end() + 12].strip())
+            found.append(text[max(0, m.start() - 14): m.end() + 14].strip())
     return sorted(set(found))
 
 
 def gate(s):
-    """반환: (PASS|HOLD, [사유…], [확인대상…]). 사유가 있으면 제목 꼬리표를 붙인다."""
-    issues = []
+    """반환: (PASS|HOLD, [막는 사유…], [알리는 사항…]).
 
-    # 1) 필수 슬롯
+    막는 사유(BLOCK) = 사실관계 위반. 고치기 전에는 초안을 만들지 않는다.
+    알리는 사항(WARN) = 수집 실패. 제목 꼬리표 + 푸터 MISSING으로 처리한다.
+    """
+    blocks, warns = [], []
+
+    # 1) 필수 슬롯 — 막지 않고 꼬리표로 처리 (지시서 §4-E-1)
     req_tiles = [t for t in (s.get("tiles") or []) if t.get("value") is None]
     if req_tiles:
-        issues.append("타일 미확보 {}건: {}".format(
+        warns.append("타일 미확보 {}건: {} → 제목 꼬리표 필요".format(
             len(req_tiles), ", ".join(t.get("label", "?") for t in req_tiles)))
     sectors = s.get("sectors") or []
     if sectors and any(x.get("chg") is None for x in sectors):
-        issues.append("섹터 등락 미확보 포함")
+        warns.append("섹터 등락 미확보 포함 → 제목 꼬리표 필요")
 
-    # 2) 방향 충돌 — 헤드라인/키포인트/산문의 지수·금리 부호가 슬롯과 어긋나는지
-    issues += direction_conflicts(s)
-
-    # 3) 캘린더 날짜 ↔ 요일 정합
-    issues += calendar_mismatch(s)
-
+    # 2) 방향 충돌
+    blocks += direction_conflicts(s)
+    # 3) 캘린더 날짜↔요일 정합, 고정 요일 지표
+    blocks += calendar_mismatch(s)
     # 4) 확정 슬롯에 추측성 단어
     hard = " ".join(filter(None, [
-        s.get("headline", ""), s.get("subtitle", ""),
-        " ".join(s.get("key_points") or []),
+        s.get("headline", ""), s.get("subtitle", ""), " ".join(s.get("key_points") or []),
     ]))
     hit = [w for w in HEDGE_WORDS if w in hard]
     if hit:
-        issues.append("제목·키포인트에 추측성 표현: {}".format(", ".join(w.strip() for w in hit)))
+        blocks.append("제목·키포인트에 추측성 표현: {}".format(", ".join(w.strip() for w in hit)))
+    # 5) 뉴스 발행일·중복
+    blocks += news_issues(s)
+    # 6) 미확보 슬롯 언급 / 내부 사정 노출 / 최상급 근거
+    blocks += null_topic_leak(s)
+    blocks += internal_leak(s)
+    blocks += superlative_blocks(s)
 
-    # 5) 뉴스 발행일
-    issues += stale_news(s)
-
-    # 6) 최상급 표현은 막지 않고 목록으로 내민다
-    return ("PASS" if not issues else "HOLD"), issues, superlatives(s)
+    return ("PASS" if not blocks else "HOLD"), blocks, warns
 
 
 def _target_date(s):
@@ -237,7 +410,9 @@ def direction_conflicts(s):
         label, chg = t.get("label", ""), t.get("chg")
         if chg is None or not label:
             continue
-        key = label.split()[0]
+        parts = label.split()
+        # '미국 10년물'의 검색어는 '미국'이 아니라 '10년물'이다
+        key = parts[-1] if parts[0] in ("미국", "한국", "국내", "일본", "중국") and len(parts) > 1 else parts[0]
         for m in re.finditer(re.escape(key), text):
             seg = text[m.start(): m.start() + 40]
             said_up = any(w in seg for w in up_w)
@@ -249,15 +424,19 @@ def direction_conflicts(s):
     return sorted(set(out))
 
 
+def calendar_rows(s):
+    rows = list(s.get("calendar") or [])
+    for g in (s.get("calendar_groups") or []):
+        rows += list(g.get("rows") or [])
+    return rows
+
+
 def calendar_mismatch(s):
     out, td = [], _target_date(s)
     if not td:
         return out
-    rows = list(s.get("calendar") or [])
-    for g in (s.get("calendar_groups") or []):     # 두 갈래(경제·엔터) 형태도 함께 검사
-        rows += list(g.get("rows") or [])
-    for row in rows:
-        d = str(row.get("d", ""))
+    for row in calendar_rows(s):
+        d, txt = str(row.get("d", "")), str(row.get("t", ""))
         m = re.match(r"(\d{1,2})/(\d{1,2})\((.)\)", d)
         if not m:
             continue
@@ -268,28 +447,65 @@ def calendar_mismatch(s):
         except ValueError:
             out.append("캘린더 날짜 없음: {}".format(d))
             continue
-        if WEEKDAY_KO[real.weekday()] != wd:
-            out.append("캘린더 요일 불일치: {} → 실제 {}요일".format(d, WEEKDAY_KO[real.weekday()]))
+        real_wd = WEEKDAY_KO[real.weekday()]
+        if real_wd != wd:
+            out.append("캘린더 요일 불일치: {} → 실제 {}요일".format(d, real_wd))
+            continue
+        for keys, need in FIXED_WEEKDAY:                # B-2 고정 발표 요일
+            if any(k in txt for k in keys) and real_wd != need:
+                out.append("발표 요일 오류: '{}'는 {}요일 발표인데 {}에 적혔다".format(
+                    next(k for k in keys if k in txt), need, d))
     return out
 
 
-def stale_news(s):
+def _tokens(t):
+    t = re.sub(r"\([^)]*\)", " ", str(t))
+    return {w for w in re.split(r"[^0-9A-Za-z가-힣%]+", t) if len(w) >= 2}
+
+
+def news_issues(s):
+    """B-5. 발행일 범위 · URL에 박힌 날짜 · 같은 사건 중복."""
     out, td = [], _target_date(s)
+    items = s.get("news") or []
     if not td:
         return out
-    for n in (s.get("news") or []):
+
+    parsed = []
+    for n in items:
+        title, url = str(n.get("title", "")), str(n.get("url", ""))
         raw = str(n.get("date", "")).strip()
         m = re.match(r"(\d{1,2})/(\d{1,2})$", raw)
+        nd = None
         if not m:
-            out.append("뉴스 발행일 확인 불가: {}".format(n.get("title", "?")[:24]))
-            continue
-        try:
-            nd = date(td.year, int(m.group(1)), int(m.group(2)))
-        except ValueError:
-            out.append("뉴스 발행일 형식 오류: {}".format(raw))
-            continue
-        if nd < td - timedelta(days=1) or nd > td:
-            out.append("뉴스 발행일 범위 밖({}): {}".format(raw, n.get("title", "?")[:24]))
+            out.append("뉴스 발행일 확인 불가: {}".format(title[:24]))
+        else:
+            try:
+                nd = date(td.year, int(m.group(1)), int(m.group(2)))
+            except ValueError:
+                out.append("뉴스 발행일 형식 오류: {}".format(raw))
+        if nd and (nd < td - timedelta(days=1) or nd > td):
+            out.append("뉴스 발행일 범위 밖({}): {}".format(raw, title[:24]))
+
+        u = re.search(r"/(20\d{2})/(\d{1,2})/(\d{1,2})(?:/|-)", url)
+        if u and nd:
+            try:
+                ud = date(int(u.group(1)), int(u.group(2)), int(u.group(3)))
+            except ValueError:
+                ud = None
+            if ud and ud != nd:
+                out.append("URL 날짜와 표기 발행일 불일치({} vs {}): {}".format(
+                    ud.isoformat(), raw, title[:24]))
+        parsed.append((title, _tokens(title)))
+
+    for i in range(len(parsed)):
+        for j in range(i + 1, len(parsed)):
+            a, b = parsed[i][1], parsed[j][1]
+            if not a or not b:
+                continue
+            jac = len(a & b) / float(len(a | b))
+            if jac >= 0.5:
+                out.append("뉴스 중복 의심({:.0%} 일치): '{}' ↔ '{}'".format(
+                    jac, parsed[i][0][:20], parsed[j][0][:20]))
     return out
 
 
@@ -297,6 +513,14 @@ def stale_news(s):
 def build(s):
     market = s.get("market", "us")
     ctx = dict(BANDS.get(market, BANDS["us"]))
+
+    notes = []
+    n = sync_us10y(s)                       # A-3: 10년물 한 슬롯
+    if n:
+        notes.append(n)
+    dropped = drop_upside_less_rows(s)      # C-1: 현재가 없는 컨센서스 행 제외
+    if dropped:
+        notes.append("컨센서스 행 제외(현재가 미확보): {}".format(", ".join(dropped)))
 
     ctx.update({
         "REPORT_KIND": "미국장" if market == "us" else "국내장",
@@ -321,10 +545,10 @@ def build(s):
         "SOURCE_NOTE_1": s.get("source_note_1", ""),
     })
 
-    tiles = [tile(t) for t in (s.get("tiles") or [])]
+    tiles = tiles_of(s.get("tiles"), per_row=4)
     ctx["TILES_ROW1"], ctx["TILES_ROW2"] = tiles[:4], tiles[4:8]
 
-    aux = [tile(a) for a in (s.get("aux") or [])]
+    aux = tiles_of(s.get("aux"))
     ctx["AUX"], ctx["IF_AUX"] = aux, bool(aux)
 
     ctx["KEY_POINTS"] = [{"N": str(i + 1), "TEXT": t}
@@ -335,7 +559,7 @@ def build(s):
     mh, mr = table(s.get("movers") or {})
     ctx["MOVERS_HEAD"], ctx["MOVERS_ROWS"] = mh, mr
 
-    rt = [tile(t) for t in (s.get("rate_tiles") or [])]
+    rt = tiles_of(s.get("rate_tiles"))
     ctx["RATE_TILES"], ctx["IF_RATE_TILES"] = rt, bool(rt)
 
     ctx["MACRO_ROWS"] = [{"K": r.get("k", ""), "V": r.get("v", "")}
@@ -343,8 +567,9 @@ def build(s):
 
     ch, cr = table(s.get("consensus") or {})
     ctx["CONS_HEAD"], ctx["CONS_ROWS"] = ch, cr
+    ctx["IF_CONS"] = bool(cr)
 
-    s4 = [tile(t) for t in (s.get("s4_tiles") or [])]
+    s4 = tiles_of(s.get("s4_tiles"))
     ctx["S4_TILES"], ctx["IF_S4_TILES"] = s4, bool(s4)
 
     fh, fr = table(s.get("flow") or {})
@@ -371,13 +596,13 @@ def build(s):
     ctx["DEEP_PROSE"] = dd.get("prose", "")
     ctx["DEEP_ROWS"] = [{"K": r.get("k", ""), "V": r.get("v", "")} for r in (dd.get("rows") or [])]
 
-    status, issues, warns = gate(s)
+    status, blocks, warns = gate(s)
     footer = s.get("footer_status", "")
     footer = footer.replace("{MISSING}", str(count_missing(s)))
     if "GATE" not in footer:
         footer = "{} · GATE {}".format(footer.rstrip(" ·"), status).lstrip(" ·").strip()
     ctx["FOOTER_STATUS"] = footer
-    return ctx, status, issues, warns
+    return ctx, status, blocks, warns, notes
 
 
 # ── 평문(plain) ───────────────────────────────────────────────────────────
@@ -391,7 +616,7 @@ def plain(s, ctx):
     add("── 지수 ──")
     for t in (s.get("tiles") or []):
         d = tile(t)
-        add("{}  {}  {}".format(d["LABEL"], d["VALUE"], d["CHG"]))
+        add("{}  {}  {}".format(d["LABEL"], d["VALUE"], d["CHG"]).rstrip())
     add("")
     add("── 1. 마감 요약 ──")
     for i, k in enumerate(s.get("key_points") or []):
@@ -403,8 +628,7 @@ def plain(s, ctx):
         parts = []
         for a in s["aux"]:
             d = tile(a)
-            parts.append("{} {}".format(d["LABEL"], MISSING) if d["VALUE"] == MISSING
-                         else "{} {} {}".format(d["LABEL"], d["VALUE"], d["CHG"]))
+            parts.append("{} {} {}".format(d["LABEL"], d["VALUE"], d["CHG"]).rstrip())
         add(" / ".join(parts))
     add("")
     add("── 2. {} ──".format(s.get("section2_title", "")))
@@ -454,20 +678,27 @@ TEMPLATE = r"""<!doctype html>
 <!--
   마감 리포트 공용 템플릿 (미국장·국내장)
   - 슬롯: {{NAME}}  /  반복: {{#ROWS}} … {{/ROWS}}  /  조건: {{#IF_X}} … {{/IF_X}}
-  - 색은 render.py가 등락 부호로 결정: UP=#C8102E DOWN=#1D5BB0 FLAT(±0.05%)=#1E8449 NA=#8a877f
-    → 각 행의 {{COLOR}} 에 위 4개 중 하나만 들어간다. LLM은 색을 쓰지 않는다.
-  - 밴드 색 {{BAND}}: 미국장 #0B2A4A / 국내장 #0F3D3E. 연한 배경 {{BAND_TINT}}: #eef2f6 / #eaf1f1.
-  - 막대 폭 {{BAR_PX}} = round(|chg| / max|chg| * 118). render.py 계산.
-  - 값이 null이면 render.py가 "[미확보]"를 회색으로 넣는다. 근사치 대체 금지.
-  - 이메일 호환을 위해 flex/grid 대신 table 사용, 폰트는 시스템 고딕 폴백.
+
+  ★메일 클라이언트 제약 (2026-09-22 실측, Gmail 초안 저장 시점에 적용)
+    1. CSS `background` 단축 속성은 통째로 삭제된다. 반드시 bgcolor 속성 +
+       style="background-color:…" 두 벌로 선언한다. `background:`를 다시 쓰지 말 것.
+    2. <!doctype>/<html>/<head>/<body>와 role 속성은 삭제된다.
+       => 페이지 배경을 <body>에 걸면 사라진다. 최외곽 <table>/<td>에 건다.
+    3. 웹폰트는 로드되지 않는다. 'JetBrains Mono' 등 monospace 지정은 타자기체로
+       폴백돼 보기 나쁘다. 시스템 고딕만 쓴다.
+    4. 막대는 <div> 배경이 아니라 <td bgcolor>로 그린다.
+
+  - 색은 mkreport.py가 등락 부호로 결정: UP=#C8102E DOWN=#1D5BB0 FLAT(±0.05%)=#1E8449 NA=#8a877f
+  - 막대 폭 {{BAR_PX}} = max(1, round(|chg| / max|chg| * 118)), 여백 {{PAD_PX}} = 118 − BAR_PX.
+  - 값이 null이면 "[미확보]"가 회색으로 들어가고 등락 칸은 빈 칸이다. 근사치 대체 금지.
 -->
-<body style="margin:0; padding:0; background:#f0efec;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f0efec;">
-<tr><td align="center" style="padding:16px 8px;">
-<table role="presentation" width="640" cellpadding="0" cellspacing="0" style="width:640px; max-width:100%; background:#ffffff; color:#1a1a1a; font-family:'Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:13px; line-height:1.6; font-variant-numeric:tabular-nums;">
+<body style="margin:0; padding:0;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#f0efec" style="background-color:#f0efec;">
+<tr><td align="center" bgcolor="#f0efec" style="background-color:#f0efec; padding:16px 8px;">
+<table role="presentation" width="640" cellpadding="0" cellspacing="0" bgcolor="#ffffff" style="width:640px; max-width:100%; background-color:#ffffff; color:#1a1a1a; font-family:'Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:13px; line-height:1.6;">
 
 <!-- ===== 밴드 ===== -->
-<tr><td style="background:{{BAND}}; color:#ffffff; padding:20px 40px 22px 40px;">
+<tr><td bgcolor="{{BAND}}" style="background-color:{{BAND}}; color:#ffffff; padding:20px 40px 22px 40px;">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
     <tr>
       <td style="font-size:11px; letter-spacing:0.08em; color:#c7d3dc;">DAILY MARKET WRAP · {{MARKET_TAG}}</td>
@@ -479,16 +710,16 @@ TEMPLATE = r"""<!doctype html>
 </td></tr>
 
 <!-- ===== 지수 타일 (8칸, 4×2) ===== -->
-<tr><td style="background:{{BAND_TINT}}; border-bottom:1px solid #d5dbe2; padding:14px 40px;">
+<tr><td bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; border-bottom:1px solid #d5dbe2; padding:14px 40px;">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
     <tr>
     {{#TILES_ROW1}}
-      <td width="25%" style="padding:4px;">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff; border:1px solid #d5dbe2;">
+      <td width="{{W}}%" style="padding:4px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#ffffff" style="background-color:#ffffff; border:1px solid #d5dbe2;">
           <tr><td style="padding:8px 10px;">
-            <div style="font-size:10px; color:#6b6963; font-family:'JetBrains Mono',Menlo,Consolas,monospace;">{{LABEL}}</div>
-            <div style="font-size:15px; font-weight:700; font-family:'JetBrains Mono',Menlo,Consolas,monospace; color:{{VALUE_COLOR}};">{{VALUE}}</div>
-            <div style="font-size:11.5px; color:{{COLOR}}; font-family:'JetBrains Mono',Menlo,Consolas,monospace;">{{CHG}}</div>
+            <div style="font-size:10px; color:#6b6963;">{{LABEL}}</div>
+            <div style="font-size:15px; font-weight:700; color:{{VALUE_COLOR}};">{{VALUE}}</div>
+            <div style="font-size:11.5px; color:{{COLOR}};">{{CHG}}&nbsp;</div>
           </td></tr>
         </table>
       </td>
@@ -496,12 +727,12 @@ TEMPLATE = r"""<!doctype html>
     </tr>
     <tr>
     {{#TILES_ROW2}}
-      <td width="25%" style="padding:4px;">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff; border:1px solid #d5dbe2;">
+      <td width="{{W}}%" style="padding:4px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#ffffff" style="background-color:#ffffff; border:1px solid #d5dbe2;">
           <tr><td style="padding:8px 10px;">
-            <div style="font-size:10px; color:#6b6963; font-family:'JetBrains Mono',Menlo,Consolas,monospace;">{{LABEL}}</div>
-            <div style="font-size:15px; font-weight:700; font-family:'JetBrains Mono',Menlo,Consolas,monospace; color:{{VALUE_COLOR}};">{{VALUE}}</div>
-            <div style="font-size:11.5px; color:{{COLOR}}; font-family:'JetBrains Mono',Menlo,Consolas,monospace;">{{CHG}}</div>
+            <div style="font-size:10px; color:#6b6963;">{{LABEL}}</div>
+            <div style="font-size:15px; font-weight:700; color:{{VALUE_COLOR}};">{{VALUE}}</div>
+            <div style="font-size:11.5px; color:{{COLOR}};">{{CHG}}&nbsp;</div>
           </td></tr>
         </table>
       </td>
@@ -529,7 +760,7 @@ TEMPLATE = r"""<!doctype html>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #d5dbe2; border-bottom:1px solid #d5dbe2; font-size:11.5px; margin-bottom:6px;">
   <tr>
   {{#AUX}}
-    <td width="25%" style="padding:6px 4px;"><span style="color:#6b6963;">{{LABEL}}</span> &nbsp;<span style="color:{{VALUE_COLOR}};">{{VALUE}}</span> <span style="color:{{COLOR}};">{{CHG}}</span></td>
+    <td width="{{W}}%" style="padding:6px 4px;"><span style="color:#6b6963;">{{LABEL}}</span> &nbsp;<span style="color:{{VALUE_COLOR}};">{{VALUE}}</span> <span style="color:{{COLOR}};">{{CHG}}</span></td>
   {{/AUX}}
   </tr>
 </table>
@@ -543,21 +774,21 @@ TEMPLATE = r"""<!doctype html>
   {{#SECTORS}}
   <tr>
     <td width="100" align="right" style="padding:2px 8px 2px 0;">{{NAME}}</td>
-    <td width="118" align="right" style="padding:2px 0;">{{#IF_NEG}}<div style="display:inline-block; height:11px; width:{{BAR_PX}}px; background:{{COLOR}}; vertical-align:middle;"></div>{{/IF_NEG}}</td>
-    <td width="1" style="background:{{BAND}}; padding:0;"><div style="width:1px; height:13px;"></div></td>
-    <td width="118" align="left" style="padding:2px 0;">{{#IF_POS}}<div style="display:inline-block; height:11px; width:{{BAR_PX}}px; background:{{COLOR}}; vertical-align:middle;"></div>{{/IF_POS}}</td>
-    <td align="right" style="padding:2px 0 2px 8px; color:{{COLOR}}; font-family:'JetBrains Mono',Menlo,Consolas,monospace;">{{CHG}}</td>
+    <td width="118" style="padding:2px 0;">{{#IF_NEG}}<table role="presentation" width="118" cellpadding="0" cellspacing="0" style="border-collapse:collapse;"><tr>{{#IF_PAD}}<td width="{{PAD_PX}}" style="font-size:0; line-height:0;">&nbsp;</td>{{/IF_PAD}}<td bgcolor="{{COLOR}}" width="{{BAR_PX}}" height="11" style="background-color:{{COLOR}}; font-size:0; line-height:0;">&nbsp;</td></tr></table>{{/IF_NEG}}</td>
+    <td width="1" bgcolor="{{BAND}}" height="13" style="background-color:{{BAND}}; padding:0; font-size:0; line-height:0;">&nbsp;</td>
+    <td width="118" style="padding:2px 0;">{{#IF_POS}}<table role="presentation" width="118" cellpadding="0" cellspacing="0" style="border-collapse:collapse;"><tr><td bgcolor="{{COLOR}}" width="{{BAR_PX}}" height="11" style="background-color:{{COLOR}}; font-size:0; line-height:0;">&nbsp;</td>{{#IF_PAD}}<td width="{{PAD_PX}}" style="font-size:0; line-height:0;">&nbsp;</td>{{/IF_PAD}}</tr></table>{{/IF_POS}}</td>
+    <td align="right" style="padding:2px 0 2px 8px; color:{{COLOR}};">{{CHG}}</td>
   </tr>
   {{/SECTORS}}
 </table>
 <div style="font-size:10.5px; color:#6b6963; border-top:1px solid #d5dbe2; padding-top:4px; margin-bottom:10px;">{{SECTOR_FOOTNOTE}}</div>
 
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:12.5px; margin-bottom:10px;">
-  <tr style="background:{{BAND_TINT}};">
-    {{#MOVERS_HEAD}}<th align="{{ALIGN}}" style="padding:6px 8px; color:{{BAND}}; font-weight:700;">{{TEXT}}</th>{{/MOVERS_HEAD}}
+  <tr bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}};">
+    {{#MOVERS_HEAD}}<th align="{{ALIGN}}" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:6px 8px; color:{{BAND}}; font-weight:700;">{{TEXT}}</th>{{/MOVERS_HEAD}}
   </tr>
   {{#MOVERS_ROWS}}
-  <tr style="border-bottom:1px solid #e3e6ea;">
+  <tr>
     {{#CELLS}}<td align="{{ALIGN}}" style="padding:4px 8px; color:{{COLOR}}; border-bottom:1px solid #e3e6ea;">{{TEXT}}</td>{{/CELLS}}
   </tr>
   {{/MOVERS_ROWS}}
@@ -570,11 +801,11 @@ TEMPLATE = r"""<!doctype html>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:10px;">
   <tr>
   {{#RATE_TILES}}
-    <td width="33%" style="padding:4px;">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #d5dbe2;"><tr><td style="padding:8px 10px;">
-        <div style="font-size:10px; color:#6b6963; font-family:'JetBrains Mono',Menlo,Consolas,monospace;">{{LABEL}}</div>
-        <div style="font-size:18px; font-weight:700; font-family:'JetBrains Mono',Menlo,Consolas,monospace; color:{{VALUE_COLOR}};">{{VALUE}}</div>
-        <div style="font-size:11.5px; color:{{COLOR}};">{{CHG}}</div>
+    <td width="{{W}}%" style="padding:4px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#ffffff" style="background-color:#ffffff; border:1px solid #d5dbe2;"><tr><td style="padding:8px 10px;">
+        <div style="font-size:10px; color:#6b6963;">{{LABEL}}</div>
+        <div style="font-size:18px; font-weight:700; color:{{VALUE_COLOR}};">{{VALUE}}</div>
+        <div style="font-size:11.5px; color:{{COLOR}};">{{CHG}}&nbsp;</div>
       </td></tr></table>
     </td>
   {{/RATE_TILES}}
@@ -584,14 +815,15 @@ TEMPLATE = r"""<!doctype html>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:12.5px; margin-bottom:10px;">
   {{#MACRO_ROWS}}
   <tr>
-    <td width="100" style="padding:5px 8px; font-weight:700; color:{{BAND}}; background:{{BAND_TINT}}; border-bottom:1px solid #e3e6ea;">{{K}}</td>
+    <td width="100" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:5px 8px; font-weight:700; color:{{BAND}}; border-bottom:1px solid #e3e6ea;">{{K}}</td>
     <td style="padding:5px 8px; border-bottom:1px solid #e3e6ea;">{{V}}</td>
   </tr>
   {{/MACRO_ROWS}}
 </table>
+{{#IF_CONS}}
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:12px; margin-bottom:6px;">
-  <tr style="background:{{BAND_TINT}};">
-    {{#CONS_HEAD}}<th align="{{ALIGN}}" style="padding:6px 8px; color:{{BAND}}; font-weight:700;">{{TEXT}}</th>{{/CONS_HEAD}}
+  <tr bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}};">
+    {{#CONS_HEAD}}<th align="{{ALIGN}}" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:6px 8px; color:{{BAND}}; font-weight:700;">{{TEXT}}</th>{{/CONS_HEAD}}
   </tr>
   {{#CONS_ROWS}}
   <tr>
@@ -600,6 +832,7 @@ TEMPLATE = r"""<!doctype html>
   {{/CONS_ROWS}}
 </table>
 <div style="font-size:10.5px; color:#6b6963; margin-bottom:6px;">{{CONS_FOOTNOTE}}</div>
+{{/IF_CONS}}
 <p style="margin:0 0 22px 0; font-size:12.5px; line-height:1.7; color:#3d3b37;">{{CONS_NOTE}}</p>
 
 <!-- ===== 4. 국내 read-through (미국장) / 수급·내일 관전 (국내장) ===== -->
@@ -608,11 +841,11 @@ TEMPLATE = r"""<!doctype html>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:10px;">
   <tr>
   {{#S4_TILES}}
-    <td width="25%" style="padding:4px;">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #d5dbe2;"><tr><td style="padding:8px 10px;">
-        <div style="font-size:10px; color:#6b6963; font-family:'JetBrains Mono',Menlo,Consolas,monospace;">{{LABEL}}</div>
-        <div style="font-size:15px; font-weight:700; font-family:'JetBrains Mono',Menlo,Consolas,monospace; color:{{VALUE_COLOR}};">{{VALUE}}</div>
-        <div style="font-size:11.5px; color:{{COLOR}};">{{CHG}}</div>
+    <td width="{{W}}%" style="padding:4px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#ffffff" style="background-color:#ffffff; border:1px solid #d5dbe2;"><tr><td style="padding:8px 10px;">
+        <div style="font-size:10px; color:#6b6963;">{{LABEL}}</div>
+        <div style="font-size:15px; font-weight:700; color:{{VALUE_COLOR}};">{{VALUE}}</div>
+        <div style="font-size:11.5px; color:{{COLOR}};">{{CHG}}&nbsp;</div>
       </td></tr></table>
     </td>
   {{/S4_TILES}}
@@ -621,8 +854,8 @@ TEMPLATE = r"""<!doctype html>
 {{/IF_S4_TILES}}
 {{#IF_S4_FLOW}}
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:12.5px; margin-bottom:6px;">
-  <tr style="background:{{BAND_TINT}};">
-    {{#FLOW_HEAD}}<th align="{{ALIGN}}" style="padding:6px 8px; color:{{BAND}}; font-weight:700;">{{TEXT}}</th>{{/FLOW_HEAD}}
+  <tr bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}};">
+    {{#FLOW_HEAD}}<th align="{{ALIGN}}" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:6px 8px; color:{{BAND}}; font-weight:700;">{{TEXT}}</th>{{/FLOW_HEAD}}
   </tr>
   {{#FLOW_ROWS}}
   <tr>
@@ -633,10 +866,10 @@ TEMPLATE = r"""<!doctype html>
 <div style="font-size:10.5px; color:#6b6963; margin-bottom:10px;">{{FLOW_FOOTNOTE}}</div>
 {{/IF_S4_FLOW}}
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:12.5px; margin-bottom:6px;">
-  <tr style="background:{{BAND_TINT}};">
-    <th align="left" width="130" style="padding:6px 8px; color:{{BAND}}; font-weight:700;">{{MAP_HEAD_1}}</th>
-    <th align="left" style="padding:6px 8px; color:{{BAND}}; font-weight:700;">{{MAP_HEAD_2}}</th>
-    <th align="left" width="52" style="padding:6px 8px; color:{{BAND}}; font-weight:700;">방향</th>
+  <tr bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}};">
+    <th align="left" width="130" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:6px 8px; color:{{BAND}}; font-weight:700;">{{MAP_HEAD_1}}</th>
+    <th align="left" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:6px 8px; color:{{BAND}}; font-weight:700;">{{MAP_HEAD_2}}</th>
+    <th align="left" width="52" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:6px 8px; color:{{BAND}}; font-weight:700;">방향</th>
   </tr>
   {{#MAP_ROWS}}
   <tr>
@@ -657,7 +890,7 @@ TEMPLATE = r"""<!doctype html>
       <div style="font-weight:700; color:{{BAND}}; padding:{{PAD_TOP}}px 8px 4px 8px;">{{GROUP}}</div>
       {{#ROWS}}
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
-        <td width="44" style="padding:4px 8px; color:{{BAND}}; font-family:'JetBrains Mono',Menlo,Consolas,monospace; font-weight:700; border-bottom:1px solid #e3e6ea;">{{D}}</td>
+        <td width="62" valign="top" style="padding:4px 8px; color:{{BAND}}; font-weight:700; border-bottom:1px solid #e3e6ea;">{{D}}</td>
         <td style="padding:4px 8px; border-bottom:1px solid #e3e6ea;">{{T}}</td>
       </tr></table>
       {{/ROWS}}
@@ -679,7 +912,7 @@ TEMPLATE = r"""<!doctype html>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:12.5px; margin-bottom:22px;">
   {{#DEEP_ROWS}}
   <tr>
-    <td width="100" style="padding:5px 8px; font-weight:700; color:{{BAND}}; background:{{BAND_TINT}}; border-bottom:1px solid #e3e6ea;">{{K}}</td>
+    <td width="100" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:5px 8px; font-weight:700; color:{{BAND}}; border-bottom:1px solid #e3e6ea;">{{K}}</td>
     <td style="padding:5px 8px; border-bottom:1px solid #e3e6ea;">{{V}}</td>
   </tr>
   {{/DEEP_ROWS}}
@@ -688,7 +921,7 @@ TEMPLATE = r"""<!doctype html>
 <!-- ===== 푸터 ===== -->
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid {{BAND}}; font-size:10.5px; color:#6b6963;">
   <tr>
-    <td style="padding-top:10px; font-family:'JetBrains Mono',Menlo,Consolas,monospace;">{{FOOTER_STATUS}}</td>
+    <td style="padding-top:10px;">{{FOOTER_STATUS}}</td>
     <td align="right" style="padding-top:10px;">투자 판단의 참고 자료이며 투자 권유가 아닙니다.</td>
   </tr>
 </table>
@@ -704,14 +937,20 @@ TEMPLATE = r"""<!doctype html>
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+
+    if "--dump-template" in flags:           # template_email.html 재생성용
+        sys.stdout.write(TEMPLATE)
+        return 0
     if not args:
         sys.stderr.write("usage: mkreport.py slots.json [outdir]\n")
         return 2
+
     with open(args[0], encoding="utf-8-sig") as f:
         slots = json.load(f)
     outdir = args[1] if len(args) > 1 else "."
 
-    ctx, status, issues, warns = build(slots)
+    ctx, status, blocks, warns, notes = build(slots)
     body_html = render(TEMPLATE, ctx)
     body_txt = plain(slots, ctx)
 
@@ -721,13 +960,22 @@ def main():
         f.write(body_txt)
 
     print("GATE {} · MISSING {}".format(status, count_missing(slots)))
-    for i in issues:
-        print("ISSUE: {}".format(i))
+    for n in notes:
+        print("NOTE: {}".format(n))
+    for b in blocks:
+        print("BLOCK: {}".format(b))
     for w in warns:
-        print("SUPERLATIVE: ...{}...".format(w))
-    print("LEFTOVER_SLOTS: {}".format(len(re.findall(r"\{\{[^}]*\}\}", body_html))))
+        print("WARN: {}".format(w))
+    leftover = re.findall(r"\{\{[^}]*\}\}", body_html)
+    print("LEFTOVER_SLOTS: {}".format(len(leftover)))
+    # Gmail이 지우는 `background` 단축 속성이 남아 있으면 안 된다(주석은 제외)
+    bad_bg = len(re.findall(r"background\s*:", re.sub(r"<!--.*?-->", "", body_html, flags=re.S)))
+    print("LEGACY_BACKGROUND_SHORTHAND: {}".format(bad_bg))
     print("WROTE: {}/body.html {} bytes, {}/body.txt {} bytes".format(
         outdir, len(body_html.encode("utf-8")), outdir, len(body_txt.encode("utf-8"))))
+    if status == "HOLD":
+        print("초안을 만들지 말 것. BLOCK 사유를 고쳐 slots.json을 다시 쓰고 재실행한다.")
+        return 3
     return 0
 
 
