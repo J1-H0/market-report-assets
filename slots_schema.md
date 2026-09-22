@@ -14,8 +14,11 @@
   코드가 거기서 복사해 덮어쓴다(양쪽이 다른 값으로 나가던 사고 방지). `rate_tiles` 쪽은
   `{"label":"미국 10년물","value":null,"chg":null,"unit":"bp"}`로 두면 된다.
 - **`consensus`에서 현재가가 `null`인 행은 코드가 통째로 뺀다.** Upside를 낼 수 없어 행이 무의미하다.
-  현재가는 시트B 종가만 쓴다(FMP `quote`는 플랜에서 막혀 있다). 시트B에 없는 티커는 컨센서스 표에
-  올리지 말고, 필요하면 `cons_note` 산문으로만 다룬다.
+  현재가 출처는 두 곳뿐이다(FMP `quote`는 플랜에서 막혀 있다):
+  ① 시트A의 **`컨센서스 시세` 탭** — 앱스스크립트가 매시간 야후에서 채운다. 기준시각이
+     `대상일 16:0x`(거래소 현지)면 정규장 확정 종가다. ② 시트B 대형주 18종.
+  둘 다에 없는 티커는 표에 올리지 말고 `cons_note` 산문으로만 다룬다. 자주 나오는 종목이면
+  `컨센서스 시세` 탭에 티커 한 줄을 추가해 두면 다음 날부터 채워진다.
 - **최상급·기록 표현을 쓰려면 `superlative_checks`에 근거를 남겨야 한다.** 없으면 GATE HOLD다.
   ```json
   "superlative_checks": [
@@ -51,8 +54,7 @@
   ],
 
   "aux": [
-    {"label": "DXY", "value": null, "chg": null},
-    {"label": "WTI", "value": null, "chg": null},
+    {"label": "WTI", "value": "93.14", "chg": 0.83},
     {"label": "GLD", "value": "401.17", "chg": 0.71},
     {"label": "TLT", "value": "81.25", "chg": -0.65}
   ],
