@@ -62,18 +62,28 @@ NULL_TOPIC_WORDS = [
     (("EWY",),                      ("EWY",)),
     (("TSM", "TSMC"),               ("TSMC",)),
     (("쿠팡", "CPNG"),               ("쿠팡",)),
+    # ── 국내장 ──
+    (("코스피", "KOSPI"),            ("코스피", "KOSPI")),
+    (("코스닥", "KOSDAQ"),           ("코스닥", "KOSDAQ")),
+    (("거래대금",),                  ("거래대금",)),
+    (("외국인",),                    ("외국인", "외인")),
+    (("기관",),                      ("기관",)),
+    (("개인",),                      ("개인",)),
 ]
 
 # ── B-3: 내부 사정 문자열 (푸터 한 줄과 제목 꼬리표 외에는 금지) ─────────
 INTERNAL_WORDS = ["시트A", "시트B", "시트C", "시트 A", "시트 B", "시트 C",
                   "노션", "프록시", "stale", "Stale", "STALE", "백필",
-                  "EDGAR", "slots.json", "게이트", "롤링 OLS", "미산출"]
+                  "EDGAR", "slots.json", "게이트", "롤링 OLS", "미산출",
+                  # 국내장 — 파이프라인 사정
+                  "KIS", "Raw Data", "미반영", "폴백", "네이버 폴백", "PDF"]
 
 # ── B-2: 발표 요일이 고정된 지표 (요일이 어긋나면 그 행은 틀린 것) ───────
 FIXED_WEEKDAY = [
     (("신규 실업수당", "실업수당 청구", "실업보험 청구"), "목"),
     (("원유재고", "원유 재고", "EIA"),                    "수"),
     (("천연가스 재고", "천연가스재고"),                     "목"),
+    (("옵션만기", "옵션 만기", "동시만기", "선물옵션 만기"), "목"),   # 한국 파생 만기일
 ]
 
 # ── B-4: 최상급·기록 표현 ────────────────────────────────────────────────
@@ -290,7 +300,10 @@ def count_missing(s):
     """미확보 '항목' 수. 한 항목에 값·등락이 둘 다 비어도 1건으로 센다."""
     n = 0
     for it in all_slot_items(s):
-        if it.get("value") is None or it.get("chg") is None:
+        if it.get("value") is None:
+            n += 1
+        # nodir 슬롯(거래대금·수급처럼 등락 개념이 없는 값)은 chg 없음을 미확보로 세지 않는다
+        elif it.get("chg") is None and not it.get("nodir"):
             n += 1
     for it in s.get("sectors") or []:        # 섹터는 등락률만 쓰는 항목
         if it.get("chg") is None:
@@ -409,6 +422,10 @@ def direction_conflicts(s):
     for t in (s.get("tiles") or []):
         label, chg = t.get("label", ""), t.get("chg")
         if chg is None or not label:
+            continue
+        # 수급·거래대금처럼 '상승/하락'으로 서술하지 않는 타일은 건너뛴다.
+        # (예: '외국인 ... 매도에 지수가 하락' 문장을 부호 충돌로 오검출하는 것을 막는다)
+        if t.get("nodir"):
             continue
         parts = label.split()
         # '미국 10년물'의 검색어는 '미국'이 아니라 '10년물'이다
