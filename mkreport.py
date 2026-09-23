@@ -43,15 +43,24 @@ MISSING = "[미확보]"
 HEDGE_WORDS = ["약 ", "추정", "근사", "가량", "안팎", "내외"]
 WEEKDAY_KO = "월화수목금토일"
 
+# ── 금지어 — 본문 어디에도 쓰지 않는다 ───────────────────────────────────
+#   '시금석'은 2026-09-23 사용자 지시로 폐기. 같은 자리는 '트리거'다.
+BANNED_WORDS = ["시금석"]
+
+# 공부섹터 3행 기본 라벨 (근거 / 트리거 / 포인트)
+DEEP_ROW_LABELS = ["근거", "트리거", "포인트"]
+# 옛 라벨 -> 새 라벨 (slots가 옛말을 보내와도 렌더 단계에서 갈아끼운다)
+DEEP_ROW_RENAME = {"시금석": "트리거"}
+
 # ── B-1: 미확보 슬롯의 대상은 본문 판단 문장에 쓸 수 없다 ────────────────
 #   (슬롯 라벨에 들어 있는 말, 본문에서 금지되는 말)
 NULL_TOPIC_WORDS = [
     (("WTI", "유가", "원유"),        ("유가", "원유", "WTI", "브렌트", "oil", "Oil", "OIL")),
-    (("DXY", "달러지수", "달러 인덱스"), ("DXY", "달러지수", "달러 인덱스", "달러인덱스")),
     (("GLD",),                      ("GLD", "금값", "금 가격", "귀금속")),
     (("TLT",),                      ("TLT", "장기국채")),
     (("VIX",),                      ("VIX", "변동성지수")),
-    (("공포탐욕", "F&G", "FEAR"),    ("공포탐욕", "공포·탐욕", "공포 탐욕", "탐욕지수")),
+    (("공포탐욕", "F&G", "FEAR", "Fear"),
+                                    ("공포탐욕", "공포·탐욕", "공포 탐욕", "탐욕지수", "Fear&Greed")),
     (("10년물",),                   ("10년물", "장기금리")),
     (("2년물",),                    ("2년물", "단기금리")),
     (("2s10s", "2S10S"),            ("2s10s", "장단기 스프레드", "스프레드")),
@@ -141,22 +150,41 @@ def fmt_chg(chg, unit="%", digits=2):
     return "{:+.{d}f}{u}".format(chg, d=digits, u=unit)
 
 
-def cell(value, chg=None, unit="%"):
+def is_blank(t):
+    """값이 비어 있는 슬롯인가. null(수집 실패)과 ""(의도적 빈칸, 휴장) 둘 다."""
+    v = t.get("value")
+    return v is None or str(v).strip() == ""
+
+
+def cell(value, chg=None, unit="%", digits=2, sub=None, tone=None):
     """타일 한 칸: VALUE / VALUE_COLOR / CHG / COLOR 를 만든다.
 
-    값이 없으면 등락 칸은 빈 문자열이다 — [미확보]를 한 칸에 두 번 찍지 않는다(A-3).
+    값이 없으면 아랫줄은 빈 문자열이다 — [미확보]를 한 칸에 두 번 찍지 않는다(A-3).
+
+    value=None  -> [미확보](회색)          value=""   -> 빈칸 (휴장 등 '해당 없음')
+    sub="문구"  -> 아랫줄에 등락 대신 그 문구 (억원 순매수 / 공포 …)
+    tone="flat" -> 부호가 없는 지표(Fear&Greed). 색을 회색으로 고정한다.
+    digits=n    -> % 소수 자릿수 (WTI는 1자리)
     """
     missing = value is None
+    blank = is_blank({"value": value})
+    if blank:
+        chg_text = ""
+    elif sub is not None:
+        chg_text = str(sub)
+    else:
+        chg_text = fmt_chg(chg, unit, digits)
     return {
         "VALUE": MISSING if missing else str(value),
         "VALUE_COLOR": NA if missing else INK,
-        "CHG": "" if missing else fmt_chg(chg, unit),
-        "COLOR": color_of(chg),
+        "CHG": chg_text,
+        "COLOR": NA if blank else (MUTED if tone == "flat" else color_of(chg)),
     }
 
 
 def tile(t):
-    d = cell(t.get("value"), t.get("chg"), t.get("unit", "%"))
+    d = cell(t.get("value"), t.get("chg"), t.get("unit", "%"),
+             digits=t.get("digits", 2), sub=t.get("sub"), tone=t.get("tone"))
     d["LABEL"] = t.get("label", "")
     if t.get("note"):
         d["LABEL"] = "{} · {}".format(d["LABEL"], t["note"])
@@ -302,8 +330,12 @@ def count_missing(s):
     for it in all_slot_items(s):
         if it.get("value") is None:
             n += 1
-        # nodir 슬롯(거래대금·수급처럼 등락 개념이 없는 값)은 chg 없음을 미확보로 세지 않는다
-        elif it.get("chg") is None and not it.get("nodir"):
+        # 의도적 빈칸("", 휴장 등 '해당 없음')은 수집 실패가 아니다
+        elif is_blank(it):
+            continue
+        # nodir 슬롯(거래대금·수급처럼 등락 개념이 없는 값)과 sub로 아랫줄을 직접 쓰는
+        # 슬롯(Fear&Greed 등급 등)은 chg 없음을 미확보로 세지 않는다
+        elif it.get("chg") is None and not it.get("nodir") and it.get("sub") is None:
             n += 1
     for it in s.get("sectors") or []:        # 섹터는 등락률만 쓰는 항목
         if it.get("chg") is None:
@@ -316,7 +348,7 @@ def null_topic_leak(s):
     text = judgement_text(s)
     out = []
     for it in all_slot_items(s):
-        if it.get("value") is not None:
+        if not is_blank(it):        # 휴장 빈칸도 '값이 없는' 것이다
             continue
         label = str(it.get("label", ""))
         for label_keys, body_words in NULL_TOPIC_WORDS:
@@ -326,6 +358,32 @@ def null_topic_leak(s):
             if hits:
                 out.append("미확보 슬롯 '{}'를 본문이 언급: {}".format(label, ", ".join(hits)))
     return sorted(set(out))
+
+
+def banned_word_leak(s):
+    """폐기한 말은 본문 어디에도 못 쓴다. '시금석' -> '트리거'(2026-09-23)."""
+    text = judgement_text(s)
+    hits = sorted({w for w in BANNED_WORDS if w in text})
+    return ["금지어 사용(대체어로 다시 쓸 것): {}".format(", ".join(hits))] if hits else []
+
+
+def normalize_deep_rows(s):
+    """공부섹터 3행 라벨을 근거/트리거/포인트로 맞춘다.
+
+    옛 라벨('시금석')이 오면 갈아끼우고, 라벨이 비어 있으면 순서대로 채운다.
+    """
+    dd = s.get("deep_dive") or {}
+    rows = dd.get("rows") or []
+    notes = []
+    for i, r in enumerate(rows):
+        k = str(r.get("k", "")).strip()
+        if not k and i < len(DEEP_ROW_LABELS):
+            r["k"] = DEEP_ROW_LABELS[i]
+            notes.append("공부섹터 {}행 라벨 기본값 적용: {}".format(i + 1, r["k"]))
+        elif k in DEEP_ROW_RENAME:
+            r["k"] = DEEP_ROW_RENAME[k]
+            notes.append("공부섹터 라벨 교체: {} -> {}".format(k, r["k"]))
+    return notes
 
 
 def internal_leak(s):
@@ -395,6 +453,7 @@ def gate(s):
     # 6) 미확보 슬롯 언급 / 내부 사정 노출 / 최상급 근거
     blocks += null_topic_leak(s)
     blocks += internal_leak(s)
+    blocks += banned_word_leak(s)
     blocks += superlative_blocks(s)
 
     return ("PASS" if not blocks else "HOLD"), blocks, warns
@@ -535,6 +594,7 @@ def build(s):
     n = sync_us10y(s)                       # A-3: 10년물 한 슬롯
     if n:
         notes.append(n)
+    notes += normalize_deep_rows(s)         # 공부섹터 라벨: 근거 / 트리거 / 포인트
     dropped = drop_upside_less_rows(s)      # C-1: 현재가 없는 컨센서스 행 제외
     if dropped:
         notes.append("컨센서스 행 제외(현재가 미확보): {}".format(", ".join(dropped)))
@@ -712,17 +772,17 @@ TEMPLATE = r"""<!doctype html>
 <body style="margin:0; padding:0;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#f0efec" style="background-color:#f0efec;">
 <tr><td align="center" bgcolor="#f0efec" style="background-color:#f0efec; padding:16px 8px;">
-<table role="presentation" width="640" cellpadding="0" cellspacing="0" bgcolor="#ffffff" style="width:640px; max-width:100%; background-color:#ffffff; color:#1a1a1a; font-family:'Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:13px; line-height:1.6;">
+<table role="presentation" width="640" cellpadding="0" cellspacing="0" bgcolor="#ffffff" style="width:640px; max-width:100%; background-color:#ffffff; color:#1a1a1a; font-family:'Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif; font-size:14px; line-height:1.6;">
 
 <!-- ===== 밴드 ===== -->
 <tr><td bgcolor="{{BAND}}" style="background-color:{{BAND}}; color:#ffffff; padding:20px 40px 22px 40px;">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
     <tr>
-      <td style="font-size:11px; letter-spacing:0.08em; color:#c7d3dc;">DAILY MARKET WRAP · {{MARKET_TAG}}</td>
-      <td align="right" style="font-size:11px; letter-spacing:0.08em; color:#c7d3dc;">{{DATE_LABEL}} · No.{{ISSUE_NO}}</td>
+      <td style="font-size:11.5px; letter-spacing:0.08em; color:#c7d3dc;">DAILY MARKET WRAP · {{MARKET_TAG}}</td>
+      <td align="right" style="font-size:11.5px; letter-spacing:0.08em; color:#c7d3dc;">{{DATE_LABEL}} · No.{{ISSUE_NO}}</td>
     </tr>
-    <tr><td colspan="2" style="padding-top:10px; font-size:23px; font-weight:900; line-height:1.35; letter-spacing:-0.01em; color:#ffffff;">{{HEADLINE}}</td></tr>
-    <tr><td colspan="2" style="padding-top:8px; font-size:12.5px; color:#dbe4ea;">{{SUBTITLE}}</td></tr>
+    <tr><td colspan="2" style="padding-top:10px; font-size:24px; font-weight:900; line-height:1.35; letter-spacing:-0.01em; color:#ffffff;">{{HEADLINE}}</td></tr>
+    <tr><td colspan="2" style="padding-top:8px; font-size:13px; color:#dbe4ea;">{{SUBTITLE}}</td></tr>
   </table>
 </td></tr>
 
@@ -734,9 +794,9 @@ TEMPLATE = r"""<!doctype html>
       <td width="{{W}}%" style="padding:4px;">
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#ffffff" style="background-color:#ffffff; border:1px solid #d5dbe2;">
           <tr><td style="padding:8px 10px;">
-            <div style="font-size:10px; color:#6b6963;">{{LABEL}}</div>
-            <div style="font-size:15px; font-weight:700; color:{{VALUE_COLOR}};">{{VALUE}}</div>
-            <div style="font-size:11.5px; color:{{COLOR}};">{{CHG}}&nbsp;</div>
+            <div style="font-size:11px; color:#6b6963;">{{LABEL}}</div>
+            <div style="font-size:17px; font-weight:700; color:{{VALUE_COLOR}};">{{VALUE}}</div>
+            <div style="font-size:12.5px; color:{{COLOR}};">{{CHG}}&nbsp;</div>
           </td></tr>
         </table>
       </td>
@@ -747,9 +807,9 @@ TEMPLATE = r"""<!doctype html>
       <td width="{{W}}%" style="padding:4px;">
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#ffffff" style="background-color:#ffffff; border:1px solid #d5dbe2;">
           <tr><td style="padding:8px 10px;">
-            <div style="font-size:10px; color:#6b6963;">{{LABEL}}</div>
-            <div style="font-size:15px; font-weight:700; color:{{VALUE_COLOR}};">{{VALUE}}</div>
-            <div style="font-size:11.5px; color:{{COLOR}};">{{CHG}}&nbsp;</div>
+            <div style="font-size:11px; color:#6b6963;">{{LABEL}}</div>
+            <div style="font-size:17px; font-weight:700; color:{{VALUE_COLOR}};">{{VALUE}}</div>
+            <div style="font-size:12.5px; color:{{COLOR}};">{{CHG}}&nbsp;</div>
           </td></tr>
         </table>
       </td>
@@ -761,9 +821,9 @@ TEMPLATE = r"""<!doctype html>
 <tr><td style="padding:22px 40px 26px 40px;">
 
 <!-- ===== 1. 마감 요약 ===== -->
-<div style="font-size:14px; font-weight:700; color:{{BAND}}; border-bottom:2px solid {{BAND}}; padding-bottom:4px; margin-bottom:10px;">1. 마감 요약</div>
+<div style="font-size:15.5px; font-weight:700; color:{{BAND}}; border-bottom:2px solid {{BAND}}; padding-bottom:4px; margin-bottom:10px;">1. 마감 요약</div>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {{BAND}}; margin-bottom:10px;">
-  <tr><td style="padding:12px 16px; font-size:12.5px;">
+  <tr><td style="padding:12px 16px; font-size:13.5px;">
     {{#KEY_POINTS}}
     <table role="presentation" cellpadding="0" cellspacing="0"><tr>
       <td valign="top" style="font-weight:700; color:{{BAND}}; width:16px; padding:2px 0;">{{N}}</td>
@@ -772,9 +832,9 @@ TEMPLATE = r"""<!doctype html>
     {{/KEY_POINTS}}
   </td></tr>
 </table>
-<p style="margin:0 0 10px 0; font-size:13.5px; line-height:1.75; text-align:justify;">{{SUMMARY_PROSE}}</p>
+<p style="margin:0 0 10px 0; font-size:14.5px; line-height:1.75; text-align:justify;">{{SUMMARY_PROSE}}</p>
 {{#IF_AUX}}
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #d5dbe2; border-bottom:1px solid #d5dbe2; font-size:11.5px; margin-bottom:6px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #d5dbe2; border-bottom:1px solid #d5dbe2; font-size:12.5px; margin-bottom:6px;">
   <tr>
   {{#AUX}}
     <td width="{{W}}%" style="padding:6px 4px;"><span style="color:#6b6963;">{{LABEL}}</span> &nbsp;<span style="color:{{VALUE_COLOR}};">{{VALUE}}</span> <span style="color:{{COLOR}};">{{CHG}}</span></td>
@@ -782,15 +842,15 @@ TEMPLATE = r"""<!doctype html>
   </tr>
 </table>
 {{/IF_AUX}}
-<div style="font-size:10.5px; color:#6b6963; margin-bottom:22px;">{{SOURCE_NOTE_1}} <span style="color:#C8102E;">상승</span> <span style="color:#1D5BB0;">하락</span> <span style="color:#1E8449;">보합(±0.05%)</span>. [미확보]는 수집 실패 항목, 근사치로 대체하지 않음.</div>
+<div style="font-size:11.5px; color:#6b6963; margin-bottom:22px;">{{SOURCE_NOTE_1}} <span style="color:#C8102E;">상승</span> <span style="color:#1D5BB0;">하락</span> <span style="color:#1E8449;">보합(±0.05%)</span>. [미확보]는 수집 실패 항목, 근사치로 대체하지 않음.</div>
 
 <!-- ===== 2. 섹터·종목 ===== -->
-<div style="font-size:14px; font-weight:700; color:{{BAND}}; border-bottom:2px solid {{BAND}}; padding-bottom:4px; margin-bottom:10px;">2. {{SECTION2_TITLE}}</div>
-{{#IF_SECTOR_NOTE_TOP}}<div style="font-size:11px; color:#6b6963; margin-bottom:4px;">{{SECTOR_NOTE_TOP}}</div>{{/IF_SECTOR_NOTE_TOP}}
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:12px; margin-bottom:6px;">
+<div style="font-size:15.5px; font-weight:700; color:{{BAND}}; border-bottom:2px solid {{BAND}}; padding-bottom:4px; margin-bottom:10px;">2. {{SECTION2_TITLE}}</div>
+{{#IF_SECTOR_NOTE_TOP}}<div style="font-size:12px; color:#6b6963; margin-bottom:4px;">{{SECTOR_NOTE_TOP}}</div>{{/IF_SECTOR_NOTE_TOP}}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px; margin-bottom:6px;">
   {{#SECTORS}}
   <tr>
-    <td width="100" align="right" style="padding:2px 8px 2px 0;">{{NAME}}</td>
+    <td width="120" align="right" style="padding:2px 8px 2px 0;">{{NAME}}</td>
     <td width="118" style="padding:2px 0;">{{#IF_NEG}}<table role="presentation" width="118" cellpadding="0" cellspacing="0" style="border-collapse:collapse;"><tr>{{#IF_PAD}}<td width="{{PAD_PX}}" style="font-size:0; line-height:0;">&nbsp;</td>{{/IF_PAD}}<td bgcolor="{{COLOR}}" width="{{BAR_PX}}" height="11" style="background-color:{{COLOR}}; font-size:0; line-height:0;">&nbsp;</td></tr></table>{{/IF_NEG}}</td>
     <td width="1" bgcolor="{{BAND}}" height="13" style="background-color:{{BAND}}; padding:0; font-size:0; line-height:0;">&nbsp;</td>
     <td width="118" style="padding:2px 0;">{{#IF_POS}}<table role="presentation" width="118" cellpadding="0" cellspacing="0" style="border-collapse:collapse;"><tr><td bgcolor="{{COLOR}}" width="{{BAR_PX}}" height="11" style="background-color:{{COLOR}}; font-size:0; line-height:0;">&nbsp;</td>{{#IF_PAD}}<td width="{{PAD_PX}}" style="font-size:0; line-height:0;">&nbsp;</td>{{/IF_PAD}}</tr></table>{{/IF_POS}}</td>
@@ -798,9 +858,9 @@ TEMPLATE = r"""<!doctype html>
   </tr>
   {{/SECTORS}}
 </table>
-<div style="font-size:10.5px; color:#6b6963; border-top:1px solid #d5dbe2; padding-top:4px; margin-bottom:10px;">{{SECTOR_FOOTNOTE}}</div>
+<div style="font-size:11.5px; color:#6b6963; border-top:1px solid #d5dbe2; padding-top:4px; margin-bottom:10px;">{{SECTOR_FOOTNOTE}}</div>
 
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:12.5px; margin-bottom:10px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:13.5px; margin-bottom:10px;">
   <tr bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}};">
     {{#MOVERS_HEAD}}<th align="{{ALIGN}}" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:6px 8px; color:{{BAND}}; font-weight:700;">{{TEXT}}</th>{{/MOVERS_HEAD}}
   </tr>
@@ -810,26 +870,26 @@ TEMPLATE = r"""<!doctype html>
   </tr>
   {{/MOVERS_ROWS}}
 </table>
-<p style="margin:0 0 22px 0; font-size:12.5px; line-height:1.7; color:#3d3b37;">{{SECTOR_NOTE}}</p>
+<p style="margin:0 0 22px 0; font-size:13.5px; line-height:1.7; color:#3d3b37;">{{SECTOR_NOTE}}</p>
 
 <!-- ===== 3. 매크로·컨센서스 ===== -->
-<div style="font-size:14px; font-weight:700; color:{{BAND}}; border-bottom:2px solid {{BAND}}; padding-bottom:4px; margin-bottom:10px;">3. 매크로 · 컨센서스</div>
+<div style="font-size:15.5px; font-weight:700; color:{{BAND}}; border-bottom:2px solid {{BAND}}; padding-bottom:4px; margin-bottom:10px;">3. 매크로 · 컨센서스</div>
 {{#IF_RATE_TILES}}
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:10px;">
   <tr>
   {{#RATE_TILES}}
     <td width="{{W}}%" style="padding:4px;">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#ffffff" style="background-color:#ffffff; border:1px solid #d5dbe2;"><tr><td style="padding:8px 10px;">
-        <div style="font-size:10px; color:#6b6963;">{{LABEL}}</div>
-        <div style="font-size:18px; font-weight:700; color:{{VALUE_COLOR}};">{{VALUE}}</div>
-        <div style="font-size:11.5px; color:{{COLOR}};">{{CHG}}&nbsp;</div>
+        <div style="font-size:11px; color:#6b6963;">{{LABEL}}</div>
+        <div style="font-size:19px; font-weight:700; color:{{VALUE_COLOR}};">{{VALUE}}</div>
+        <div style="font-size:12.5px; color:{{COLOR}};">{{CHG}}&nbsp;</div>
       </td></tr></table>
     </td>
   {{/RATE_TILES}}
   </tr>
 </table>
 {{/IF_RATE_TILES}}
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:12.5px; margin-bottom:10px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:13.5px; margin-bottom:10px;">
   {{#MACRO_ROWS}}
   <tr>
     <td width="100" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:5px 8px; font-weight:700; color:{{BAND}}; border-bottom:1px solid #e3e6ea;">{{K}}</td>
@@ -838,7 +898,7 @@ TEMPLATE = r"""<!doctype html>
   {{/MACRO_ROWS}}
 </table>
 {{#IF_CONS}}
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:12px; margin-bottom:6px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:12.5px; margin-bottom:6px;">
   <tr bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}};">
     {{#CONS_HEAD}}<th align="{{ALIGN}}" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:6px 8px; color:{{BAND}}; font-weight:700;">{{TEXT}}</th>{{/CONS_HEAD}}
   </tr>
@@ -848,21 +908,21 @@ TEMPLATE = r"""<!doctype html>
   </tr>
   {{/CONS_ROWS}}
 </table>
-<div style="font-size:10.5px; color:#6b6963; margin-bottom:6px;">{{CONS_FOOTNOTE}}</div>
+<div style="font-size:11.5px; color:#6b6963; margin-bottom:6px;">{{CONS_FOOTNOTE}}</div>
 {{/IF_CONS}}
-<p style="margin:0 0 22px 0; font-size:12.5px; line-height:1.7; color:#3d3b37;">{{CONS_NOTE}}</p>
+<p style="margin:0 0 22px 0; font-size:13.5px; line-height:1.7; color:#3d3b37;">{{CONS_NOTE}}</p>
 
 <!-- ===== 4. 국내 read-through (미국장) / 수급·내일 관전 (국내장) ===== -->
-<div style="font-size:14px; font-weight:700; color:{{BAND}}; border-bottom:2px solid {{BAND}}; padding-bottom:4px; margin-bottom:10px;">4. {{SECTION4_TITLE}}</div>
+<div style="font-size:15.5px; font-weight:700; color:{{BAND}}; border-bottom:2px solid {{BAND}}; padding-bottom:4px; margin-bottom:10px;">4. {{SECTION4_TITLE}}</div>
 {{#IF_S4_TILES}}
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:10px;">
   <tr>
   {{#S4_TILES}}
     <td width="{{W}}%" style="padding:4px;">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#ffffff" style="background-color:#ffffff; border:1px solid #d5dbe2;"><tr><td style="padding:8px 10px;">
-        <div style="font-size:10px; color:#6b6963;">{{LABEL}}</div>
-        <div style="font-size:15px; font-weight:700; color:{{VALUE_COLOR}};">{{VALUE}}</div>
-        <div style="font-size:11.5px; color:{{COLOR}};">{{CHG}}&nbsp;</div>
+        <div style="font-size:11px; color:#6b6963;">{{LABEL}}</div>
+        <div style="font-size:17px; font-weight:700; color:{{VALUE_COLOR}};">{{VALUE}}</div>
+        <div style="font-size:12.5px; color:{{COLOR}};">{{CHG}}&nbsp;</div>
       </td></tr></table>
     </td>
   {{/S4_TILES}}
@@ -870,7 +930,7 @@ TEMPLATE = r"""<!doctype html>
 </table>
 {{/IF_S4_TILES}}
 {{#IF_S4_FLOW}}
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:12.5px; margin-bottom:6px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:13.5px; margin-bottom:6px;">
   <tr bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}};">
     {{#FLOW_HEAD}}<th align="{{ALIGN}}" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:6px 8px; color:{{BAND}}; font-weight:700;">{{TEXT}}</th>{{/FLOW_HEAD}}
   </tr>
@@ -880,11 +940,11 @@ TEMPLATE = r"""<!doctype html>
   </tr>
   {{/FLOW_ROWS}}
 </table>
-<div style="font-size:10.5px; color:#6b6963; margin-bottom:10px;">{{FLOW_FOOTNOTE}}</div>
+<div style="font-size:11.5px; color:#6b6963; margin-bottom:10px;">{{FLOW_FOOTNOTE}}</div>
 {{/IF_S4_FLOW}}
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:12.5px; margin-bottom:6px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:13.5px; margin-bottom:6px;">
   <tr bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}};">
-    <th align="left" width="130" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:6px 8px; color:{{BAND}}; font-weight:700;">{{MAP_HEAD_1}}</th>
+    <th align="left" width="165" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:6px 8px; color:{{BAND}}; font-weight:700;">{{MAP_HEAD_1}}</th>
     <th align="left" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:6px 8px; color:{{BAND}}; font-weight:700;">{{MAP_HEAD_2}}</th>
     <th align="left" width="52" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:6px 8px; color:{{BAND}}; font-weight:700;">방향</th>
   </tr>
@@ -896,18 +956,18 @@ TEMPLATE = r"""<!doctype html>
   </tr>
   {{/MAP_ROWS}}
 </table>
-<div style="font-size:10.5px; color:#6b6963; margin-bottom:22px;">{{S4_FOOTNOTE}}</div>
+<div style="font-size:11.5px; color:#6b6963; margin-bottom:22px;">{{S4_FOOTNOTE}}</div>
 
 <!-- ===== 5. 일정·뉴스 ===== -->
-<div style="font-size:14px; font-weight:700; color:{{BAND}}; border-bottom:2px solid {{BAND}}; padding-bottom:4px; margin-bottom:10px;">5. 일정 · 뉴스</div>
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:12.5px; margin-bottom:6px;">
+<div style="font-size:15.5px; font-weight:700; color:{{BAND}}; border-bottom:2px solid {{BAND}}; padding-bottom:4px; margin-bottom:10px;">5. 일정 · 뉴스</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13.5px; margin-bottom:6px;">
   <tr>
     <td width="50%" valign="top" style="padding-right:12px;">
       {{#CAL_GROUPS}}
       <div style="font-weight:700; color:{{BAND}}; padding:{{PAD_TOP}}px 8px 4px 8px;">{{GROUP}}</div>
       {{#ROWS}}
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
-        <td width="62" valign="top" style="padding:4px 8px; color:{{BAND}}; font-weight:700; border-bottom:1px solid #e3e6ea;">{{D}}</td>
+        <td width="74" valign="top" style="padding:4px 8px; color:{{BAND}}; font-weight:700; border-bottom:1px solid #e3e6ea;">{{D}}</td>
         <td style="padding:4px 8px; border-bottom:1px solid #e3e6ea;">{{T}}</td>
       </tr></table>
       {{/ROWS}}
@@ -921,12 +981,12 @@ TEMPLATE = r"""<!doctype html>
     </td>
   </tr>
 </table>
-<div style="font-size:10.5px; color:#6b6963; margin-bottom:22px;">{{S5_FOOTNOTE}}</div>
+<div style="font-size:11.5px; color:#6b6963; margin-bottom:22px;">{{S5_FOOTNOTE}}</div>
 
 <!-- ===== 6. 공부섹터 ===== -->
-<div style="font-size:14px; font-weight:700; color:{{BAND}}; border-bottom:2px solid {{BAND}}; padding-bottom:4px; margin-bottom:10px;">6. 공부섹터 — {{DEEP_TITLE}}</div>
-<p style="margin:0 0 10px 0; font-size:13px; line-height:1.75; text-align:justify;">{{DEEP_PROSE}}</p>
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:12.5px; margin-bottom:22px;">
+<div style="font-size:15.5px; font-weight:700; color:{{BAND}}; border-bottom:2px solid {{BAND}}; padding-bottom:4px; margin-bottom:10px;">6. 공부섹터 — {{DEEP_TITLE}}</div>
+<p style="margin:0 0 10px 0; font-size:14px; line-height:1.75; text-align:justify;">{{DEEP_PROSE}}</p>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:13.5px; margin-bottom:22px;">
   {{#DEEP_ROWS}}
   <tr>
     <td width="100" bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; padding:5px 8px; font-weight:700; color:{{BAND}}; border-bottom:1px solid #e3e6ea;">{{K}}</td>
@@ -936,7 +996,7 @@ TEMPLATE = r"""<!doctype html>
 </table>
 
 <!-- ===== 푸터 ===== -->
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid {{BAND}}; font-size:10.5px; color:#6b6963;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid {{BAND}}; font-size:11.5px; color:#6b6963;">
   <tr>
     <td style="padding-top:10px;">{{FOOTER_STATUS}}</td>
     <td align="right" style="padding-top:10px;">투자 판단의 참고 자료이며 투자 권유가 아닙니다.</td>
