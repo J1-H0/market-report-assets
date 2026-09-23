@@ -41,7 +41,7 @@
 
 <!-- ===== 지수 타일 (8칸, 4×2) ===== -->
 <tr><td bgcolor="{{BAND_TINT}}" style="background-color:{{BAND_TINT}}; border-bottom:1px solid #d5dbe2; padding:14px 40px;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="table-layout:fixed;">
     <tr>
     {{#TILES_ROW1}}
       <td width="{{W}}%" style="padding:4px;">
@@ -87,7 +87,7 @@
 </table>
 <p style="margin:0 0 10px 0; font-size:14.5px; line-height:1.75; text-align:justify;">{{SUMMARY_PROSE}}</p>
 {{#IF_AUX}}
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #d5dbe2; border-bottom:1px solid #d5dbe2; font-size:12.5px; margin-bottom:6px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="table-layout:fixed; border-top:1px solid #d5dbe2; border-bottom:1px solid #d5dbe2; font-size:12.5px; margin-bottom:6px;">
   <tr>
   {{#AUX}}
     <td width="{{W}}%" style="padding:6px 4px;"><span style="color:#6b6963;">{{LABEL}}</span> &nbsp;<span style="color:{{VALUE_COLOR}};">{{VALUE}}</span> <span style="color:{{COLOR}};">{{CHG}}</span></td>
@@ -128,7 +128,7 @@
 <!-- ===== 3. 매크로·컨센서스 ===== -->
 <div style="font-size:15.5px; font-weight:700; color:{{BAND}}; border-bottom:2px solid {{BAND}}; padding-bottom:4px; margin-bottom:10px;">3. 매크로 · 컨센서스</div>
 {{#IF_RATE_TILES}}
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:10px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="table-layout:fixed; margin-bottom:10px;">
   <tr>
   {{#RATE_TILES}}
     <td width="{{W}}%" style="padding:4px;">
@@ -168,7 +168,7 @@
 <!-- ===== 4. 국내 read-through (미국장) / 수급·내일 관전 (국내장) ===== -->
 <div style="font-size:15.5px; font-weight:700; color:{{BAND}}; border-bottom:2px solid {{BAND}}; padding-bottom:4px; margin-bottom:10px;">4. {{SECTION4_TITLE}}</div>
 {{#IF_S4_TILES}}
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:10px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="table-layout:fixed; margin-bottom:10px;">
   <tr>
   {{#S4_TILES}}
     <td width="{{W}}%" style="padding:4px;">
